@@ -1,4 +1,6 @@
 import json
+import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -17,6 +19,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Hero Nexus API", version="1.0.0", lifespan=lifespan)
+logger = logging.getLogger("hero_nexus.api")
 
 
 def comic_vine_client() -> ComicVineClient:
@@ -26,6 +29,42 @@ def comic_vine_client() -> ComicVineClient:
 
 def error_response(error: ComicVineError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail={"code": error.code, "message": error.message})
+
+
+def character_fallback(message: str, client: ComicVineClient) -> ChatResponse | None:
+    """Return a short, source-backed profile if the model provider is unavailable."""
+    match = re.search(
+        r"\b(?:sobre|quem\s+é|quem\s+e|fale\s+(?:mais\s+)?(?:sobre|de)|me\s+conte\s+(?:mais\s+)?(?:sobre|de))\s+(.+?)\s*[?.!]*$",
+        message.strip(), re.IGNORECASE,
+    )
+    if not match:
+        return None
+    query = re.sub(r"^(?:o|a|os|as)\s+", "", match.group(1).strip(), flags=re.IGNORECASE)
+    if not query:
+        return None
+    page = client.search_characters(query, limit=8, offset=0)
+    results = page.get("results", [])
+    if not results:
+        return None
+    normalized = query.casefold()
+    character = next((item for item in results if item.get("name", "").casefold() == normalized), results[0])
+    name = character.get("name", "Esse personagem")
+    facts = []
+    if character.get("real_name"):
+        facts.append(f"Identidade: {character['real_name']}.")
+    if character.get("deck"):
+        facts.append(str(character["deck"]).strip())
+    powers = [power.get("name") for power in character.get("powers", []) if power.get("name")]
+    if powers:
+        facts.append("Poderes registrados: " + ", ".join(powers[:6]) + ".")
+    teams = [team.get("name") for team in character.get("teams", []) if team.get("name")]
+    if teams:
+        facts.append("Equipes: " + ", ".join(teams[:4]) + ".")
+    if not facts:
+        facts.append("Encontrei o personagem na base da Comic Vine, mas ela não retornou uma descrição curta.")
+    answer = f"{name}\n\n" + "\n\n".join(facts)
+    source = character.get("api_detail_url") or "https://comicvine.gamespot.com/"
+    return ChatResponse(answer=answer, sources=[source])
 
 
 @app.get("/health")
@@ -100,6 +139,14 @@ async def chat(request: ChatRequest):
                     continue
         return ChatResponse(answer=str(answer), sources=sources)
     except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        logger.warning("AI completion failed (%s, status=%s)", type(exc).__name__, status)
+        try:
+            fallback = character_fallback(request.message.strip(), client)
+            if fallback is not None:
+                return fallback
+        except Exception as fallback_error:
+            logger.warning("Character fallback failed (%s)", type(fallback_error).__name__)
         raise HTTPException(status_code=502, detail={"code": "ai_request_failed", "message": "The AI could not complete the request."}) from exc
     finally:
         client.close()

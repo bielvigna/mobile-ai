@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -80,12 +81,19 @@ class ComicVineClient:
             params.update(limit=limit, offset=offset)
         if filter_value:
             params["filter"] = filter_value
-        try:
-            response = self.client.get(BASE_URL + path, params=params)
-        except httpx.TimeoutException as exc:
-            raise ComicVineError("comic_vine_timeout", "Comic Vine did not respond in time.", 504) from exc
-        except httpx.HTTPError as exc:
-            raise ComicVineError("comic_vine_unavailable", "Could not reach Comic Vine.", 502) from exc
+        response = None
+        for attempt in range(3):
+            try:
+                response = self.client.get(BASE_URL + path, params=params)
+                if response.status_code < 500 or attempt == 2:
+                    break
+            except httpx.TimeoutException as exc:
+                if attempt == 2:
+                    raise ComicVineError("comic_vine_timeout", "Comic Vine did not respond in time.", 504) from exc
+            except httpx.HTTPError as exc:
+                if attempt == 2:
+                    raise ComicVineError("comic_vine_unavailable", "Could not reach Comic Vine.", 502) from exc
+            time.sleep(0.3 * (attempt + 1))
         if response.status_code == 429:
             raise ComicVineError("comic_vine_rate_limited", "Comic Vine rate limit reached. Try again shortly.", 429)
         if response.status_code >= 500:
@@ -113,8 +121,22 @@ class ComicVineClient:
                 "has_more": safe_offset + len(results) < total}
 
     def get_character(self, character_id: int) -> dict[str, Any]:
-        payload = self._get("character", resource_id=character_id, fields=CHARACTER_FIELDS)
-        result = payload.get("results") or {}
+        try:
+            payload = self._get("character", resource_id=character_id, fields=CHARACTER_FIELDS)
+            result = payload.get("results") or {}
+        except ComicVineError as detail_error:
+            if detail_error.status_code not in {502, 504}:
+                raise
+            # Comic Vine's item endpoint intermittently fails while its collection endpoint
+            # remains available. Retry the lookup by ID through the same collection used by
+            # the catalog, with its smaller, known-good field set.
+            try:
+                fallback = self._get("characters", filter_value=f"id:{character_id}",
+                                     fields=LIST_FIELDS, limit=1)
+                results = fallback.get("results") or []
+                result = results[0] if isinstance(results, list) and results else {}
+            except ComicVineError:
+                raise detail_error
         mapped = map_character(result)
         if mapped is None:
             raise ComicVineError("character_not_found", "Character not found.", 404)
